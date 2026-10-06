@@ -187,6 +187,9 @@ class LiftOverEngine:
         self.side = side
         prepared = [_PreparedChain.prepare(c, side) for c in chains]
         self._index: dict[str, list[_PreparedChain]] = {}
+        # chain_uid（id(pc)）→ prepared chain，供整体迁移等场景复用同一条
+        # chain 的块内映射与相对方向，避免与 candidates_for 各算一遍。
+        self._by_uid: dict[int, _PreparedChain] = {id(pc): pc for pc in prepared}
         for pc in prepared:
             self._index.setdefault(pc.src_chrom, []).append(pc)
         for lst in self._index.values():
@@ -195,6 +198,19 @@ class LiftOverEngine:
     def has_chrom(self, chrom: str) -> bool:
         """源侧是否存在该染色体（区分“无此染色体”与“落在缺口/未覆盖区”）。"""
         return chrom in self._index
+
+    def relative_forward(self, chain_uid: int) -> bool:
+        """该 chain 上源与目标是否同向（块内仿射方向，所有块一致）。
+
+        单外显子转录本无法靠目标块几何顺序判断方向，统一以 chain 自身的
+        相对方向（target/query 两侧 strand 相同）为准。
+        """
+        pc = self._by_uid[chain_uid]
+        return bool(pc.blocks[0].same_orientation)
+
+    def map_uid(self, chain_uid: int, start: int, end: int) -> list[Fragment]:
+        """用指定 chain（uid）映射任意源子区间，返回块内片段。"""
+        return self._by_uid[chain_uid].map_interval(start, end)
 
     def candidates_for(self, chrom: str, start: int, end: int) -> list[Candidate]:
         """对任意源侧区间给出全部命中候选，不做状态判定。

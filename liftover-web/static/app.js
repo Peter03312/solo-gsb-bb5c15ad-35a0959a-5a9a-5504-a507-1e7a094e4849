@@ -34,6 +34,7 @@ const tbody = document.getElementById("result-tbody");
 const previewNote = document.getElementById("preview-note");
 const downloadBtn = document.getElementById("download-btn");
 const downloadAdjBtn = document.getElementById("download-adj-btn");
+const download12Btn = document.getElementById("download12-btn");
 const decisionNote = document.getElementById("decision-note");
 const actionMsg = document.getElementById("action-msg");
 const filterBtns = document.querySelectorAll(".filter");
@@ -58,7 +59,9 @@ const auditDownloadBtn = document.getElementById("audit-download-btn");
 let currentToken = null;
 let currentName = null;
 let currentRows = [];
-let currentKind = "single"; // single / double（来自服务端响应）
+let currentKind = "single"; // single / double / single12 / double12（来自服务端响应）
+let currentFmt = "bed3";     // bed3 / bed12
+let bed12DownloadUrl = null;
 let activeFilter = "all";
 // 裁决状态：{源行号: 候选/路径序号(1基)}；撤销后该键删除
 let decisions = {};
@@ -87,6 +90,24 @@ function currentMode() {
   return form.querySelector('input[name="mode"]:checked').value;
 }
 
+function currentFmtValue() {
+  return form.querySelector('input[name="fmt"]:checked').value;
+}
+
+function isBed12() {
+  return currentFmt === "bed12";
+}
+
+form.querySelectorAll('input[name="fmt"]').forEach((radio) => {
+  radio.addEventListener("change", () => {
+    const fmt = currentFmtValue();
+    const bedLabel = document.getElementById("bed-label");
+    bedLabel.textContent = fmt === "bed12"
+      ? "BED12 转录本文件（12 列，零基左闭右开）"
+      : "BED 文件（零基左闭右开）";
+  });
+});
+
 form.querySelectorAll('input[name="mode"]').forEach((radio) => {
   radio.addEventListener("change", () => {
     const mode = currentMode();
@@ -109,8 +130,12 @@ form.addEventListener("submit", async (ev) => {
   resultBox.classList.add("hidden");
 
   const mode = currentMode();
+  currentFmt = currentFmtValue();
+  const bed12 = currentFmt === "bed12";
   const clientErrors = [];
-  if (!bedInput.files[0]) clientErrors.push("请选择 BED 文件");
+  if (!bedInput.files[0]) {
+    clientErrors.push(bed12 ? "请选择 BED12 文件" : "请选择 BED 文件");
+  }
   if (mode === "single" && !chainInput.files[0]) {
     clientErrors.push("请选择 UCSC chain 文件");
   }
@@ -128,14 +153,27 @@ form.addEventListener("submit", async (ev) => {
 
   const fd = new FormData();
   fd.append("bed", bedInput.files[0]);
-  let url = "/api/liftover";
-  if (mode === "double") {
+  let url;
+  if (bed12) {
+    if (mode === "double") {
+      fd.append("chain1", chain1Input.files[0]);
+      fd.append("chain2", chain2Input.files[0]);
+      fd.append("side1", form.querySelector('input[name="side1"]:checked').value);
+      fd.append("side2", form.querySelector('input[name="side2"]:checked').value);
+      url = "/api/liftover12/double";
+    } else {
+      fd.append("chain", chainInput.files[0]);
+      fd.append("side", form.querySelector('input[name="side"]:checked').value);
+      url = "/api/liftover12";
+    }
+  } else if (mode === "double") {
+    url = "/api/liftover2";
     fd.append("chain1", chain1Input.files[0]);
     fd.append("chain2", chain2Input.files[0]);
     fd.append("side1", form.querySelector('input[name="side1"]:checked').value);
     fd.append("side2", form.querySelector('input[name="side2"]:checked').value);
-    url = "/api/liftover2";
   } else {
+    url = "/api/liftover";
     fd.append("chain", chainInput.files[0]);
     fd.append("side", form.querySelector('input[name="side"]:checked').value);
   }
@@ -153,9 +191,14 @@ form.addEventListener("submit", async (ev) => {
     currentRows = data.preview.rows;
     decisions = {};
     resultVersion = 0;
-    resetFilterPanel();
+    bed12DownloadUrl = data.download_url || null;
+    resetPanelsForKind();
     renderStats(statsEl, data.preview.total, data.preview.counts);
-    await refreshDecisions();
+    if (isBed12()) {
+      renderDecisionNote();
+    } else {
+      await refreshDecisions();
+    }
     renderRows();
     resultBox.classList.remove("hidden");
     resultBox.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -181,6 +224,25 @@ downloadAdjBtn.addEventListener("click", () => {
     "",
   );
 });
+
+download12Btn.addEventListener("click", () => {
+  if (!bed12DownloadUrl) return;
+  triggerDownload(bed12DownloadUrl, currentName || "");
+});
+
+function resetPanelsForKind() {
+  const bed12 = isBed12();
+  // BED12：只有“下载迁移后 BED12”，无 TSV/裁决/筛选/审计
+  downloadBtn.classList.toggle("hidden", bed12);
+  downloadAdjBtn.classList.toggle("hidden", bed12);
+  download12Btn.classList.toggle("hidden", !bed12);
+  if (bed12) {
+    filterPanel.classList.add("hidden");
+    auditPanel.classList.add("hidden");
+  } else {
+    resetFilterPanel();
+  }
+}
 
 function triggerDownload(href, name) {
   const a = document.createElement("a");
@@ -210,6 +272,17 @@ async function refreshDecisions() {
 }
 
 function renderDecisionNote() {
+  if (isBed12()) {
+    const total = currentRows.length;
+    const amb = currentRows.filter((r) => r.status === "ambiguous").length;
+    const unm = currentRows.filter((r) => r.status === "unmapped").length;
+    const okN = currentRows.filter((r) => r.status === "mapped").length;
+    decisionNote.innerHTML =
+      `BED12 转录本整体迁移：共 <b>${total}</b> 条转录本，完全映射 <b>${okN}</b> 条、` +
+      `歧义 <b>${amb}</b> 条（多条完整路径，<b>全部导出</b>，不自动选取）、` +
+      `无完整路径 <b>${unm}</b> 条（仅在预览中给出原因，<b>不会</b>写入下载的 BED12）。`;
+    return;
+  }
   const noun = currentKind === "double" ? "路径" : "候选";
   const total = currentRows.filter((r) => r.status === "ambiguous").length;
   const picked = currentRows.filter(
@@ -487,8 +560,10 @@ function renderRows() {
   const noun = currentKind === "double" ? "路径" : "候选";
   previewNote.textContent =
     currentRows.length > PREVIEW_LIMIT
-      ? `预览仅显示前 ${PREVIEW_LIMIT} 行（当前筛选 ${rows.length} 行 / 共 ${currentRows.length} 行）；下载的 TSV 包含全部结果。`
-      : `共 ${currentRows.length} 行源区间；多片段、歧义${noun}在“候选 / 片段”列内分行展开。`;
+      ? `预览仅显示前 ${PREVIEW_LIMIT} 行（当前筛选 ${rows.length} 行 / 共 ${currentRows.length} 行）；下载的 ${isBed12() ? "BED12" : "TSV"} 包含全部结果。`
+      : isBed12()
+        ? `共 ${currentRows.length} 条转录本；每条完整路径在“候选 / 片段”列内按目标块展开，歧义路径全部保留。`
+        : `共 ${currentRows.length} 行源区间；多片段、歧义${noun}在“候选 / 片段”列内分行展开。`;
 
   for (const row of shown) {
     const tr = document.createElement("tr");
@@ -499,14 +574,16 @@ function renderRows() {
 
     const tdSrc = document.createElement("td");
     tdSrc.className = "mono";
-    tdSrc.textContent = `${row.src_chrom}:${row.src_start}-${row.src_end}`;
+    tdSrc.textContent = isBed12()
+      ? `${row.src_chrom}:${row.src_start}-${row.src_end} · ${row.name || "(无名)"} · 链 ${row.strand} · ${row.block_count} 外显子`
+      : `${row.src_chrom}:${row.src_start}-${row.src_end}`;
 
     const tdStatus = document.createElement("td");
     const badge = document.createElement("span");
     badge.className = `badge ${row.status}`;
     badge.textContent = STATUS_TEXT[row.status] || row.status;
     tdStatus.appendChild(badge);
-    if (row.status === "unmapped" && row.failed_stage) {
+    if (!isBed12() && row.status === "unmapped" && row.failed_stage) {
       const tag = document.createElement("span");
       tag.className = "stage-tag";
       tag.textContent = STAGE_TEXT[row.failed_stage] || row.failed_stage;
@@ -515,17 +592,20 @@ function renderRows() {
     }
     if (row.status === "ambiguous") {
       const tag = document.createElement("span");
-      const picked = decisions[row.line_no];
-      tag.className = `decision-tag ${picked === undefined ? "pending" : "picked"}`;
-      tag.textContent = picked === undefined
-        ? "未裁决"
-        : `已选${currentKind === "double" ? "路径" : "候选"} ${picked}`;
+      tag.className = "decision-tag " + (isBed12() ? "pending" : (decisions[row.line_no] === undefined ? "pending" : "picked"));
+      tag.textContent = isBed12()
+        ? `${row.candidates.length} 条完整路径（全部导出）`
+        : (decisions[row.line_no] === undefined
+          ? "未裁决"
+          : `已选${currentKind === "double" ? "路径" : "候选"} ${decisions[row.line_no]}`);
       tdStatus.appendChild(document.createElement("br"));
       tdStatus.appendChild(tag);
     }
 
     const tdDest = document.createElement("td");
-    if (currentKind === "double") {
+    if (isBed12()) {
+      renderBed12Dest(row, tdDest);
+    } else if (currentKind === "double") {
       renderDoubleDest(row, tdDest);
     } else {
       renderSingleDest(row, tdDest);
@@ -540,6 +620,57 @@ function renderRows() {
   }
 }
 
+// BED12 整体迁移结果的“候选 / 片段”列（只读：无人工裁决入口）
+function renderBed12Dest(row, tdDest) {
+  if (row.candidates.length === 0) {
+    tdDest.textContent = "—（无完整路径，不导出）";
+    return;
+  }
+  row.candidates.forEach((cand, ci) => {
+    const div = document.createElement("div");
+    div.className = "cand";
+    const head = document.createElement("div");
+    head.className = "cand-head";
+    const chainText = cand.chain2_id
+      ? `chain #${cand.chain1_id} × chain #${cand.chain2_id}`
+      : `chain #${cand.chain1_id}`;
+    const orderText = cand.forward ? "源顺序同向" : "源顺序整体反转";
+    head.textContent =
+      `路径 ${ci + 1}/${row.candidates.length} · ${chainText} → ` +
+      `${cand.dest_chrom} · 输出链 ${cand.output_strand}（${orderText}）`;
+    div.appendChild(head);
+
+    if (cand.chain2_id) {
+      const mid = document.createElement("div");
+      mid.className = "path-cov";
+      mid.textContent = `中间染色体 ${cand.mid_chrom}（${cand.mid_strand}）`;
+      div.appendChild(mid);
+    }
+
+    cand.blocks.forEach((blk, bi) => {
+      const fl = document.createElement("div");
+      fl.className = "frag-line";
+      fl.textContent = cand.chain2_id
+        ? `块${bi + 1} 源[${blk.src_start},${blk.src_end}) → ` +
+          `中间 ${cand.mid_chrom}:[${blk.mid_start},${blk.mid_end}) → ` +
+          `${cand.dest_chrom}:[${blk.dest_start},${blk.dest_end})`
+        : `块${bi + 1} 源[${blk.src_start},${blk.src_end}) → ` +
+          `${cand.dest_chrom}:[${blk.dest_start},${blk.dest_end})`;
+      div.appendChild(fl);
+    });
+
+    const thick = document.createElement("div");
+    thick.className = "path-cov";
+    const coding = cand.thick_dest_end > cand.thick_dest_start;
+    thick.textContent = coding
+      ? `映射后编码区 thick=[${cand.thick_dest_start},${cand.thick_dest_end})`
+      : "非编码转录本：thickStart=thickEnd（零长 thick）";
+    div.appendChild(thick);
+
+    tdDest.appendChild(div);
+  });
+}
+
 function formatSize(n) {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -551,12 +682,14 @@ function formatSize(n) {
 // ---------------------------------------------------------------------------
 
 function resetFilterPanel() {
-  filterPanel.classList.toggle("hidden", currentKind !== "double");
+  // BED12 结果没有质量筛选/冲突审计（整体迁移不产出片段 TSV）
+  const bed12 = isBed12();
+  filterPanel.classList.toggle("hidden", bed12 || currentKind !== "double");
   filterResult.classList.add("hidden");
   filterDownloadUrl = null;
   filterDownloadName = null;
   setFilterMsg("");
-  auditPanel.classList.toggle("hidden", currentKind !== "double");
+  auditPanel.classList.toggle("hidden", bed12 || currentKind !== "double");
   auditResult.classList.add("hidden");
   auditDownloadUrl = null;
   auditDownloadName = null;

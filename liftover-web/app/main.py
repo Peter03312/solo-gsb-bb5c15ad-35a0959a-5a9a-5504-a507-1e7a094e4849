@@ -50,10 +50,12 @@ from .audit import (
     summarize,
 )
 from .bed import parse_bed
+from .bed12 import parse_bed12
 from .chain import parse_chain
 from .engine import RowResult
 from .engine import LiftOverEngine
 from .engine2 import TwoSegmentEngine
+from .engine12 import TranscriptLiftoverEngine
 from .filtering import FILTER_STATUSES, filter_double_rows
 from .report import (
     build_adjudicated_tsv,
@@ -63,6 +65,7 @@ from .report import (
     build_tsv2,
     rows_to_preview,
 )
+from .report12 import build_bed12, rows_to_preview12
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "..", "static")
@@ -107,9 +110,27 @@ class _AuditJob:
     parent_token: str            # 来源任务 token（仅溯源用）
 
 
+@dataclass
+class _Bed12Job:
+    """一次 BED12 转录本整体迁移的产物。
+
+    BED12 只有“完整路径”概念：下载内容仅含 mapped / ambiguous 行的完整
+    候选（歧义全部导出，不自动选取），unmapped 行不出任何伪 BED12；
+    不支持裁决/筛选/审计，因此与 BED3 任务（_Job）分开存储。
+    """
+
+    records: list                # 已通过严格校验的 Bed12Record
+    rows: list                   # Bed12Row 列表（含 unmapped 原因，仅预览用）
+    bed_bytes: bytes             # 可下载 BED12（无 BOM，只含完整候选）
+    filename: str
+    created_at: float
+    kind: str = "single12"       # single12 / double12
+
+
 _jobs: dict[str, _Job] = {}
 _filter_jobs: dict[str, _FilterJob] = {}
 _audit_jobs: dict[str, _AuditJob] = {}
+_bed12_jobs: dict[str, _Bed12Job] = {}
 
 
 def _prune_jobs() -> None:
@@ -137,6 +158,14 @@ def _prune_jobs() -> None:
         for k in sorted(_audit_jobs,
                         key=lambda x: _audit_jobs[x].created_at)[: len(_audit_jobs) - MAX_JOBS]:
             _audit_jobs.pop(k, None)
+    expired_b = [k for k, j in _bed12_jobs.items()
+                 if now - j.created_at > JOB_TTL_SECONDS]
+    for k in expired_b:
+        _bed12_jobs.pop(k, None)
+    if len(_bed12_jobs) > MAX_JOBS:
+        for k in sorted(_bed12_jobs,
+                        key=lambda x: _bed12_jobs[x].created_at)[: len(_bed12_jobs) - MAX_JOBS]:
+            _bed12_jobs.pop(k, None)
 
 
 def _read_upload(f: UploadFile) -> str:
@@ -277,6 +306,149 @@ async def liftover2(
         "kind": "double",
         "preview": preview,
     }
+
+
+# ---------------------------------------------------------------------------
+# BED12 转录本整体迁移（单段 / 双段）
+#
+# 只有“整条转录本完整迁移”的路径才进入下载：所有外显子完整映射、同一
+# 目标染色体、方向一致、按源顺序保持或整体反转、目标块互不重叠。多条
+# 完整路径全部标为歧义并导出；无完整路径的行只在预览中给原因，绝不
+# 生成伪 BED12。BED12 与 BED3 任务分开存储，下载端点独立。
+# ---------------------------------------------------------------------------
+
+def _bed12_name(kind: str, side1: str, side2: str | None, stamp: str) -> str:
+    if kind == "single12":
+        other = "query" if side1 == "target" else "target"
+        return f"liftover12_{side1}_to_{other}_{stamp}.bed"
+    return f"liftover12_double_{side1}-{side2}_{stamp}.bed"
+
+
+@app.post("/api/liftover12")
+async def liftover12(
+    bed: UploadFile = File(...),
+    chain: UploadFile = File(...),
+    side: str = Form(...),
+):
+    """BED12 转录本整体迁移（单段，一份 chain）。"""
+    if side not in ("target", "query"):
+        raise HTTPException(status_code=400,
+                            detail={"errors": ["side 必须是 target 或 query"]})
+
+    bed_text = _read_upload(bed)
+    chain_text = _read_upload(chain)
+
+    bed_result = parse_bed12(bed_text)
+    chain_result = parse_chain(chain_text)
+
+    errors = list(bed_result.errors) + list(chain_result.errors)
+    if errors:
+        # 任何 BED12/chain 格式错误都汇总行号并拒绝整次转换
+        raise HTTPException(status_code=400, detail={"errors": errors})
+
+    engine = TranscriptLiftoverEngine(chain_result.chains, side)
+    rows = engine.convert_all(bed_result.records)
+    preview = rows_to_preview12(rows)
+
+    bed_payload = build_bed12(bed_result.records, rows).encode("utf-8")
+    token = secrets.token_urlsafe(24)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    filename = _bed12_name("single12", side, None, stamp)
+    _prune_jobs()
+    _bed12_jobs[token] = _Bed12Job(
+        records=bed_result.records, rows=rows, bed_bytes=bed_payload,
+        filename=filename, created_at=time.time(), kind="single12",
+    )
+
+    return {
+        "download_token": token,
+        "download_name": filename,
+        "download_url": f"/api/download12/{token}",
+        "kind": "single12",
+        "preview": preview,
+    }
+
+
+@app.post("/api/liftover12/double")
+async def liftover12_double(
+    bed: UploadFile = File(...),
+    chain1: UploadFile = File(...),
+    chain2: UploadFile = File(...),
+    side1: str = Form(...),
+    side2: str = Form(...),
+):
+    """BED12 转录本整体迁移（双段：同一 BED12 依次经过两份 chain）。
+
+    每段都必须把每个外显子完整映射（恰好一个片段、全长覆盖），并按
+    (chain1, chain2) 归并整条路径；任一文件格式错误都带行号整体拒绝。
+    """
+    side_errors = [
+        f"{name} 必须是 target 或 query"
+        for name, val in (("side1", side1), ("side2", side2))
+        if val not in ("target", "query")
+    ]
+    if side_errors:
+        raise HTTPException(status_code=400, detail={"errors": side_errors})
+
+    bed_text = _read_upload(bed)
+    chain1_text = _read_upload(chain1)
+    chain2_text = _read_upload(chain2)
+
+    bed_result = parse_bed12(bed_text)
+    chain1_result = parse_chain(chain1_text)
+    chain2_result = parse_chain(chain2_text)
+
+    errors = list(bed_result.errors)
+    errors += [f"chain 文件 1：{e}" for e in chain1_result.errors]
+    errors += [f"chain 文件 2：{e}" for e in chain2_result.errors]
+    if errors:
+        raise HTTPException(status_code=400, detail={"errors": errors})
+
+    engine = TranscriptLiftoverEngine(
+        chain1_result.chains, side1, chain2_result.chains, side2
+    )
+    rows = engine.convert_all(bed_result.records)
+    preview = rows_to_preview12(rows)
+
+    bed_payload = build_bed12(bed_result.records, rows).encode("utf-8")
+    token = secrets.token_urlsafe(24)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    filename = _bed12_name("double12", side1, side2, stamp)
+    _prune_jobs()
+    _bed12_jobs[token] = _Bed12Job(
+        records=bed_result.records, rows=rows, bed_bytes=bed_payload,
+        filename=filename, created_at=time.time(), kind="double12",
+    )
+
+    return {
+        "download_token": token,
+        "download_name": filename,
+        "download_url": f"/api/download12/{token}",
+        "kind": "double12",
+        "preview": preview,
+    }
+
+
+@app.get("/api/download12/{token}")
+async def download12(token: str) -> Response:
+    """下载整体迁移后的 BED12（12 列，无 BOM）。
+
+    只含 mapped / ambiguous 行的完整候选；歧义行的每条完整路径各占一行
+    （全部导出）。无完整路径的行不产生伪 BED12；若全部行都无完整路径，
+    文件为空（0 字节），预览中已逐行给出原因。
+    """
+    _prune_jobs()
+    job = _bed12_jobs.get(token)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"errors": ["BED12 结果不存在或已过期，请重新提交转换"]},
+        )
+    return Response(
+        content=job.bed_bytes,
+        media_type="text/x-bed; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{job.filename}"'},
+    )
 
 
 def _get_job_or_404(token: str) -> _Job:
