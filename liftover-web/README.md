@@ -7,7 +7,11 @@
 
 - **单段**：一份 chain 的常规迁移；
 - **双段**：同一 BED 依次经过**两份 chain** 迁移（如 hg19→hg38→T2T），
-  第二段只处理第一段实际映射到的片段，最终片段精确回溯到原 BED 源坐标。
+  第二段只处理第一段实际映射到的片段，最终片段精确回溯到原 BED 源坐标；
+- **BED12 转录本整体迁移**（单段 / 双段）：严格 12 列 BED12，转录本
+  必须**整体**迁移——全部外显子完整映射、落于同一目标染色体、方向一致、
+  按源顺序保持或整体反转、目标块互不重叠才成为候选；多候选全部导出不
+  自动选取，无完整路径时不产生伪 BED12 行。
 
 - 后端：Python 3.11+ / FastAPI / Uvicorn
 - 前端：原生 HTML + CSS + JavaScript（无任何 CDN / 外网依赖）
@@ -25,16 +29,19 @@
 └── liftover-web/
     ├── app/                  # 后端
     │   ├── bed.py            # BED 解析（零基左闭右开，错误带行号）
+    │   ├── bed12.py          # 严格 BED12 解析（12 列 / 块几何 / thick 端点校验）
     │   ├── chain.py          # UCSC chain 解析（严格校验，错误带行号）
     │   ├── engine.py         # 单段区间转换引擎（缺口拆分 / 歧义 / 负链）
     │   ├── engine2.py        # 双段串联引擎（路径 / 回溯 / 失败阶段）
+    │   ├── engine12.py       # BED12 转录本整体迁移引擎（单段 / 双段候选裁决）
     │   ├── filtering.py      # 双段结果质量筛选（最小最终覆盖率 + 保留状态）
     │   ├── audit.py          # 双段结果源行冲突审计（最终坐标系重叠检测）
     │   ├── report.py         # 单段与双段 TSV 导出、筛选版 TSV、预览 JSON
-    │   └── main.py           # FastAPI 入口（含歧义人工裁决、质量筛选与冲突审计接口）
+    │   ├── report12.py       # BED12 导出（含歧义全部候选）与预览 JSON
+    │   └── main.py           # FastAPI 入口（BED3 + BED12 接口、裁决、筛选、审计）
     ├── static/               # 前端（纯本地资源）
-    ├── examples/             # 可直接试用的 BED / chain 示例（含双段示例）
-    ├── tests/                # pytest 测试（134 个用例）
+    ├── examples/             # 可直接试用的 BED / chain 示例（含双段、BED12 示例）
+    ├── tests/                # pytest 测试（166 个用例）
     ├── scripts/init.sh       # 本地开发依赖初始化
     ├── Dockerfile            # 方式 B 构建入口：以本目录为上下文
     ├── docker-compose.yml    # 两种启动方式共用
@@ -213,6 +220,49 @@ bash scripts/init.sh
 6. 双段结果还可做**源行冲突审计**（见「双段源行冲突审计」一节）：
    检查不同源行在最终坐标系上是否重叠，页面显示汇总并可下载明细 TSV。
 
+### BED12 转录本整体迁移（单段 / 双段）
+
+1. 转换模式选择「BED12 转录本整体迁移（单段）」或「（双段）」。
+2. 选择**严格 12 列**的 BED12 文件，chain 文件与各段源侧的选择同 BED3。
+3. 点击「校验并转换」，逐行预览每个转录本的状态与候选；确认后下载 BED12。
+
+输入校验（任一错误带物理行号列出，**整次转换被拒绝**，不产生下载）：
+
+- 恰好 12 列；`chromStart < chromEnd`；`strand` 只能是 `+`/`-`；
+  `score` 为 0..1000 整数；`itemRgb` 为 `0` 或 `r,g,b`（0..255）；
+- `blockCount` 为正整数且与 `blockSizes`/`blockStarts` 的逗号项数一致；
+  块按起点严格有序、互不重叠（允许相接），首块起点为 0，末块末端恰好
+  顶到 `chromEnd`，所有块位于区间内；
+- `thickStart`/`thickEnd` 位于区间内且不颠倒，且**两个端点都必须落在
+  某个外显子（块）内**（零基左闭右开，恰好压在块边界不算在内）；
+  非编码记录的零长 thick 同样必须落在外显子内。
+
+候选判定（转录本只能整体迁移，没有 partial）：
+
+- 一条 chain（双段时为「第一段 chain → 同一最终目标染色体」的路径）
+  只有在**每个外显子都完整落在单个对齐块内**（不允许跨缺口）、全部
+  目标外显子**同一目标染色体**、相对方向**一致**、目标块按源顺序
+  **保持或整体反转**且**互不重叠**（允许相接）时才成为候选；
+- 缺口或结构冲突只淘汰该条路径；多条完整路径并存时行状态标为
+  `ambiguous`，**全部候选都导出**（每个候选一行 BED12），不自动选取；
+- 没有任何完整路径时行状态为 `unmapped`，预览中给出原因（双段另标
+  `failed_stage = segment1/segment2`），该转录本**不写入**下载文件
+  （绝不产生伪 BED12 行）；没有任何可导出记录时下载文件为空。
+
+输出 BED12 的重算规则：
+
+- 按**目标坐标**升序重排块，重算 `chromStart/chromEnd` 与
+  `blockStarts`（`blockSizes` 长度不变，整体反转时大小序列随块逆序）；
+- `thickStart/thickEnd` 按映射后外显子内的编码部分重算（端点使用其
+  所在外显子的块内映射）；非编码记录保持零长 thick；
+- 整体反向（双段时为两段相对方向之积为 -1）时**翻转 strand**；
+  `name`、`score`、`itemRgb` 原样保留。
+
+歧义转录本行与 BED3 一样可在预览页逐行裁决（候选/路径序号从 1 开始，
+乐观锁版本号语义相同）；原始下载字节不随裁决改变，裁决版只保留被选
+候选。BED12 的筛选与审计接口不适用（BED12 token 调用
+`/api/result/{token}/filter|audit` 返回 404）。
+
 ### 双段源行冲突审计
 
 双段转换完成后，预览页底部出现「源行冲突审计」面板（仅双段结果可用）：
@@ -379,6 +429,10 @@ b_source_line, b_path_index, b_chain1_id, b_chain2_id
 - 双段模式下 BED、chain 文件 1、chain 文件 2 任一文件出错同样整体
   拒绝，错误分别以 `BED 第 N 行`、`chain 文件 1：…`、`chain 文件 2：…`
   标明来源。
+- BED12 模式（单段 / 双段）的 BED12 文件错误统一以 `BED12 第 N 行：…`
+  标明（12 列、块数/长度/起点、外显子边界、thick 范围与端点等），同样
+  整次拒绝；转录本**没有完整路径不是格式错误**——此时预览正常返回
+  （状态 `unmapped` 并给出原因），只是该行不写入下载的 BED12。
 
 ---
 
@@ -495,6 +549,91 @@ curl -s -X POST http://localhost:8080/api/liftover2 \
   原始 TSV（25 列），`GET/POST /api/result/{token}/decisions` 按路径
   序号裁决，`GET /api/download/{token}/adjudicated` 下载裁决版
   （26 列）。
+
+### BED12 转录本整体迁移（单段 / 双段）
+
+单段：`POST /api/bed12/liftover`，字段同 `/api/liftover`（`bed` 必须
+是严格 12 列 BED12）；双段：`POST /api/bed12/liftover2`，字段同
+`/api/liftover2`。BED12 任务与 BED3 任务**完全独立**（token 命名空间
+互不相同），预览、下载、裁决使用 `/api/bed12/...` 路径。
+
+```bash
+# 单段
+curl -s -X POST http://localhost:8080/api/bed12/liftover \
+  -F "bed=@liftover-web/examples/example_bed12.bed" \
+  -F "chain=@liftover-web/examples/demo.chain" \
+  -F "side=target"
+
+# 双段
+curl -s -X POST http://localhost:8080/api/bed12/liftover2 \
+  -F "bed=@liftover-web/examples/example_bed12_double.bed" \
+  -F "chain1=@liftover-web/examples/demo_seg1.chain" \
+  -F "chain2=@liftover-web/examples/demo_seg2.chain" \
+  -F "side1=target" -F "side2=target"
+```
+
+成功响应的 `kind` 为 `bed12_single` / `bed12_double`，预览结构：
+
+```json
+{
+  "download_token": "……",
+  "download_name": "liftover_bed12_target_to_query_<时间戳>.bed",
+  "kind": "bed12_single",
+  "preview": {
+    "total": 4,
+    "counts": {"mapped": 2, "partial": 0, "ambiguous": 1, "unmapped": 1},
+    "exported_bed12_lines": 4,
+    "rows": [
+      {"line_no": 18, "name": "tx-amb", "status": "ambiguous",
+       "failed_stage": "", "src_chrom": "chr1", "src_start": 310, "src_end": 390,
+       "candidates": [
+         {"candidate_index": 1, "chain_id": "1", "dest_chrom": "chrA",
+          "dest_strand": "+", "reversed": false,
+          "out_start": 354, "out_end": 434, "out_strand": "+",
+          "out_thick_start": 359, "out_thick_end": 429,
+          "out_block_sizes": [20, 30], "out_block_starts": [0, 30],
+          "exons": [{"exon_index": 0, "src_start": 310, "src_end": 330,
+                     "dest_start": 354, "dest_end": 374, "mid_start": null,
+                     "mid_end": null}]}
+       ]}
+    ]
+  }
+}
+```
+
+- BED12 只有 `mapped` / `ambiguous` / `unmapped` 三种状态（无 partial）；
+  `exported_bed12_lines` 是下载文件中的总行数（mapped 1 行 + 每个歧义
+  候选 1 行；unmapped 行不计）；
+- 双段候选额外带 `chain1_id` / `chain2_id`（一条路径内不同外显子可命
+  中不同 chain2 时以 `+` 连接）、`mid_chrom` / `mid_strand` 及每个外
+  显子的 `mid_start/mid_end` 中间坐标；`reversed=true` 表示整体反转、
+  输出 strand 已翻转；
+- BED12 / chain1 / chain2 任一格式错误返回 400 并带行号（双段的
+  chain 错误同样以「chain 文件 1：」「chain 文件 2：」开头），整次
+  转换被拒绝，不产生任何下载令牌。
+
+下载与裁决（与 BED3 语义一致，路径前缀换成 `/api/bed12`）：
+
+```bash
+TOKEN=<上一步返回的 download_token>
+
+# 原始 BED12（全部歧义候选；unmapped 行不写入；无映射行过多时文件可能为空）
+curl -OJ "http://localhost:8080/api/bed12/download/${TOKEN}"
+
+# 查看 / 提交裁决（版本乐观锁、409 并发、候选越界 400 等语义同 BED3）
+curl -s "http://localhost:8080/api/bed12/result/${TOKEN}/decisions"
+curl -s -X POST "http://localhost:8080/api/bed12/result/${TOKEN}/decisions" \
+  -H 'Content-Type: application/json' \
+  -d '{"version":0,"source_line":18,"candidate_index":2}'
+
+# 裁决版 BED12（文件名 …​.adjudicated.v<版本>.bed）
+curl -OJ "http://localhost:8080/api/bed12/download/${TOKEN}/adjudicated"
+```
+
+下载内容为**标准 12 列 BED12**（`text/x-bed; charset=utf-8`，无额外
+TSV 列、无注释头）；原始下载字节在裁决前后保持不变。token 不存在或
+过期返回 404：`{"errors": ["BED12 结果不存在或已过期，请重新提交转换"]}`。
+BED12 token 不能用于 BED3 的 `/api/download`、筛选与审计接口（404）。
 
 ### 下载结果 TSV
 
@@ -788,6 +927,37 @@ curl -OJ "http://localhost:8080/api/download/audit/${AUDIT_TOKEN}"
 （行 4）、第一段+第二段缺口叠加的部分映射（行 5）、双路径歧义
 （行 6）、第二段无映射（行 7 中间染色体不存在、行 8 落在对齐范围外）、
 第一段无映射（行 9 范围外、行 10 无此染色体）。
+
+### BED12 转录本快速试用
+
+```bash
+# 页面模式选择「BED12 转录本整体迁移（单段）」：
+#   BED12: examples/example_bed12.bed   chain: examples/demo.chain   side=target
+# 或 API：
+curl -s -X POST http://localhost:8080/api/bed12/liftover \
+  -F "bed=@liftover-web/examples/example_bed12.bed" \
+  -F "chain=@liftover-web/examples/demo.chain" \
+  -F "side=target"
+```
+
+`example_bed12.bed` 共 4 条转录本，覆盖：3 外显子完全映射并重算 thick
+（`tx-full`：thick 60..170 → 104..214）、两个候选（chrA 正链 / chrB
+负链整体反转并翻转 strand）全部导出的歧义（`tx-amb`，第 18 行）、
+外显子跨缺口导致无完整路径不导出（`tx-gap`）、零长 thick 的负链非
+编码记录（`lncRNA-x`，strand 保持 `-`）。
+
+双段示例 `example_bed12_double.bed` 覆盖：完全映射（`g1`）、两条完整
+路径（#2×#11 chrW 同向 / #2×#12 chrV 整体反转）的歧义（`g2`）、
+第一段失败（`g3`，`failed_stage=segment1`）与第二段失败
+（`g4`，`failed_stage=segment2`）。
+
+```bash
+curl -s -X POST http://localhost:8080/api/bed12/liftover2 \
+  -F "bed=@liftover-web/examples/example_bed12_double.bed" \
+  -F "chain1=@liftover-web/examples/demo_seg1.chain" \
+  -F "chain2=@liftover-web/examples/demo_seg2.chain" \
+  -F "side1=target" -F "side2=target"
+```
 
 ---
 

@@ -10,7 +10,7 @@
 <body>
 <header>
   <h1>离线基因组区间迁移</h1>
-  <p class="sub">上传 BED 与 UCSC chain 文件，在浏览器中预览每条源区间的转换状态后下载结果。支持单段（一份 chain）与双段（两份 chain 依次迁移）。全程离线，数据不离开本机服务。</p>
+  <p class="sub">上传 BED 与 UCSC chain 文件，在浏览器中预览每条源区间的转换状态后下载结果。支持 BED3 单段（一份 chain）、BED3 双段（两份 chain 依次迁移）以及 BED12 转录本整体迁移（单段 / 双段，严格 12 列校验）。全程离线，数据不离开本机服务。</p>
 </header>
 
 <main>
@@ -19,16 +19,22 @@
       <div class="form-row side-row">
         <span class="file-title">转换模式</span>
         <label class="radio">
-          <input type="radio" name="mode" value="single" checked> 单段（一份 chain）
+          <input type="radio" name="mode" value="single" checked> 单段（BED3 + 一份 chain）
         </label>
         <label class="radio">
-          <input type="radio" name="mode" value="double"> 双段（同一 BED 依次经过两份 chain）
+          <input type="radio" name="mode" value="double"> 双段（BED3 依次经过两份 chain）
+        </label>
+        <label class="radio">
+          <input type="radio" name="mode" value="bed12_single"> BED12 转录本整体迁移（单段）
+        </label>
+        <label class="radio">
+          <input type="radio" name="mode" value="bed12_double"> BED12 转录本整体迁移（双段）
         </label>
       </div>
 
       <div class="form-row">
         <label class="file-box">
-          <span class="file-title">BED 文件（零基左闭右开）</span>
+          <span class="file-title" id="bed-label">BED 文件（零基左闭右开）</span>
           <input type="file" id="bed" name="bed" accept=".bed,.txt,.tsv,text/plain">
           <span class="file-hint" id="bed-hint">未选择文件</span>
         </label>
@@ -92,6 +98,11 @@
         <button type="submit" id="submit-btn">校验并转换</button>
         <span class="limit-hint">单文件上限由 LIFTOVER_MAX_UPLOAD_MB 控制（默认 50 MB）</span>
       </div>
+      <p class="limit-hint" id="mode-hint">
+        BED3 模式只取前 3 列（额外列忽略）；BED12 模式要求严格 12 列，
+        转录本必须整体迁移——全部外显子完整映射、落于同一目标染色体、方向一致、
+        顺序保持或整体反转、目标块互不重叠才成为候选，多候选全部导出不自动选取。
+      </p>
     </form>
   </section>
 
@@ -105,8 +116,8 @@
     <div class="result-head">
       <h2>转换预览</h2>
       <div class="btn-row">
-        <button id="download-btn" type="button">下载原始结果 TSV</button>
-        <button id="download-adj-btn" class="secondary" type="button">下载裁决版 TSV</button>
+        <button id="download-btn" type="button">下载原始结果（TSV / BED12）</button>
+        <button id="download-adj-btn" class="secondary" type="button">下载裁决版（TSV / BED12）</button>
       </div>
     </div>
 

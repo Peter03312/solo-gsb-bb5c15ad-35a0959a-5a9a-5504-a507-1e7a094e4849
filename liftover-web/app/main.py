@@ -50,10 +50,12 @@ from .audit import (
     summarize,
 )
 from .bed import parse_bed
+from .bed12 import parse_bed12
 from .chain import parse_chain
 from .engine import RowResult
 from .engine import LiftOverEngine
 from .engine2 import TwoSegmentEngine
+from .engine12 import Bed12Engine, Bed12Engine2
 from .filtering import FILTER_STATUSES, filter_double_rows
 from .report import (
     build_adjudicated_tsv,
@@ -63,6 +65,11 @@ from .report import (
     build_tsv2,
     rows_to_preview,
 )
+from .report12 import (
+    build_bed12,
+    build_bed12_adjudicated,
+    rows_to_bed12_preview,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "..", "static")
@@ -71,7 +78,7 @@ MAX_UPLOAD_BYTES = int(os.getenv("LIFTOVER_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 JOB_TTL_SECONDS = int(os.getenv("LIFTOVER_JOB_TTL_SECONDS", "3600"))
 MAX_JOBS = int(os.getenv("LIFTOVER_MAX_JOBS", "100"))
 
-app = FastAPI(title="离线基因组区间迁移 (BED liftover)", version="1.4.0")
+app = FastAPI(title="离线基因组区间迁移 (BED liftover)", version="1.5.0")
 
 
 @dataclass
@@ -107,9 +114,25 @@ class _AuditJob:
     parent_token: str            # 来源任务 token（仅溯源用）
 
 
+@dataclass
+class _Bed12Job:
+    """一次 BED12 转录本整体迁移的结果（独立于 BED3 任务）。"""
+
+    rows: list                   # Bed12Row 列表
+    records: list                # 原始 Bed12Record 列表（导出时保留 name 等列）
+    bed12_bytes: bytes           # 原始 BED12 结果（永不改变；可能只有空串）
+    filename: str
+    created_at: float
+    kind: str                    # bed12_single / bed12_double
+    decisions: dict[int, int] = field(default_factory=dict)
+    version: int = 0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
 _jobs: dict[str, _Job] = {}
 _filter_jobs: dict[str, _FilterJob] = {}
 _audit_jobs: dict[str, _AuditJob] = {}
+_bed12_jobs: dict[str, _Bed12Job] = {}
 
 
 def _prune_jobs() -> None:
@@ -137,6 +160,14 @@ def _prune_jobs() -> None:
         for k in sorted(_audit_jobs,
                         key=lambda x: _audit_jobs[x].created_at)[: len(_audit_jobs) - MAX_JOBS]:
             _audit_jobs.pop(k, None)
+    expired_b12 = [k for k, j in _bed12_jobs.items()
+                   if now - j.created_at > JOB_TTL_SECONDS]
+    for k in expired_b12:
+        _bed12_jobs.pop(k, None)
+    if len(_bed12_jobs) > MAX_JOBS:
+        for k in sorted(_bed12_jobs,
+                        key=lambda x: _bed12_jobs[x].created_at)[: len(_bed12_jobs) - MAX_JOBS]:
+            _bed12_jobs.pop(k, None)
 
 
 def _read_upload(f: UploadFile) -> str:
@@ -277,6 +308,250 @@ async def liftover2(
         "kind": "double",
         "preview": preview,
     }
+
+
+# ---------------------------------------------------------------------------
+# BED12 转录本整体迁移（单段 / 双段）
+#
+# 与 BED3 接口完全独立：任务存放在 _bed12_jobs，下载/裁决使用
+# /api/bed12/... 路径，原 BED3 的预览、TSV、裁决、筛选、审计行为不变。
+# ---------------------------------------------------------------------------
+
+def _validate_sides(*pairs: tuple[str, str]) -> list[str]:
+    return [
+        f"{name} 必须是 target 或 query"
+        for name, val in pairs
+        if val not in ("target", "query")
+    ]
+
+
+@app.post("/api/bed12/liftover")
+async def bed12_liftover(
+    bed: UploadFile = File(...),
+    chain: UploadFile = File(...),
+    side: str = Form(...),
+):
+    """BED12 转录本单段整体迁移：上传严格 12 列 BED12 + 一份 chain。"""
+    side_errors = _validate_sides(("side", side))
+    if side_errors:
+        raise HTTPException(status_code=400, detail={"errors": side_errors})
+
+    bed_text = _read_upload(bed)
+    chain_text = _read_upload(chain)
+    bed_result = parse_bed12(bed_text)
+    chain_result = parse_chain(chain_text)
+
+    errors = list(bed_result.errors) + list(chain_result.errors)
+    if errors:
+        raise HTTPException(status_code=400, detail={"errors": errors})
+
+    engine = Bed12Engine(chain_result.chains, side)
+    rows = engine.convert_all(bed_result.records)
+    preview = rows_to_bed12_preview(rows)
+
+    bed12_text = build_bed12(rows, bed_result.records)
+    payload = bed12_text.encode("utf-8")
+    token = secrets.token_urlsafe(24)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    filename = f"liftover_bed12_{side}_to_{'query' if side == 'target' else 'target'}_{stamp}.bed"
+    _prune_jobs()
+    _bed12_jobs[token] = _Bed12Job(
+        rows=rows, records=bed_result.records, bed12_bytes=payload,
+        filename=filename, created_at=time.time(), kind="bed12_single",
+    )
+
+    return {
+        "download_token": token,
+        "download_name": filename,
+        "kind": "bed12_single",
+        "preview": preview,
+    }
+
+
+@app.post("/api/bed12/liftover2")
+async def bed12_liftover2(
+    bed: UploadFile = File(...),
+    chain1: UploadFile = File(...),
+    chain2: UploadFile = File(...),
+    side1: str = Form(...),
+    side2: str = Form(...),
+):
+    """BED12 转录本双段整体迁移：同一 BED12 依次经过两份 chain。"""
+    side_errors = _validate_sides(("side1", side1), ("side2", side2))
+    if side_errors:
+        raise HTTPException(status_code=400, detail={"errors": side_errors})
+
+    bed_text = _read_upload(bed)
+    chain1_text = _read_upload(chain1)
+    chain2_text = _read_upload(chain2)
+    bed_result = parse_bed12(bed_text)
+    chain1_result = parse_chain(chain1_text)
+    chain2_result = parse_chain(chain2_text)
+
+    errors = list(bed_result.errors)
+    errors += [f"chain 文件 1：{e}" for e in chain1_result.errors]
+    errors += [f"chain 文件 2：{e}" for e in chain2_result.errors]
+    if errors:
+        raise HTTPException(status_code=400, detail={"errors": errors})
+
+    engine = Bed12Engine2(
+        chain1_result.chains, side1, chain2_result.chains, side2
+    )
+    rows = engine.convert_all(bed_result.records)
+    preview = rows_to_bed12_preview(rows)
+
+    bed12_text = build_bed12(rows, bed_result.records)
+    payload = bed12_text.encode("utf-8")
+    token = secrets.token_urlsafe(24)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    filename = f"liftover_bed12_double_{side1}-{side2}_{stamp}.bed"
+    _prune_jobs()
+    _bed12_jobs[token] = _Bed12Job(
+        rows=rows, records=bed_result.records, bed12_bytes=payload,
+        filename=filename, created_at=time.time(), kind="bed12_double",
+    )
+
+    return {
+        "download_token": token,
+        "download_name": filename,
+        "kind": "bed12_double",
+        "preview": preview,
+    }
+
+
+def _get_bed12_job_or_404(token: str) -> _Bed12Job:
+    _prune_jobs()
+    job = _bed12_jobs.get(token)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"errors": ["BED12 结果不存在或已过期，请重新提交转换"]},
+        )
+    return job
+
+
+def _bed12_response(payload: bytes, filename: str) -> Response:
+    return Response(
+        content=payload,
+        media_type="text/x-bed; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/bed12/download/{token}")
+async def bed12_download(token: str) -> Response:
+    """下载原始 BED12 结果（全部歧义候选；unmapped 行不产生任何行）。"""
+    job = _get_bed12_job_or_404(token)
+    return _bed12_response(job.bed12_bytes, job.filename)
+
+
+@app.get("/api/bed12/result/{token}/decisions")
+async def bed12_list_decisions(token: str) -> dict:
+    """查看 BED12 结果当前的歧义裁决选择与版本。"""
+    job = _get_bed12_job_or_404(token)
+    ambiguous = {r.line_no: r for r in job.rows if r.status == "ambiguous"}
+    return {
+        "download_token": token,
+        "version": job.version,
+        "decisions": [
+            {
+                "source_line": line_no,
+                "candidate_index": job.decisions.get(line_no),
+                "candidate_count": len(ambiguous[line_no].candidates),
+            }
+            for line_no in sorted(ambiguous)
+        ],
+    }
+
+
+@app.post("/api/bed12/result/{token}/decisions")
+async def bed12_submit_decisions(token: str, request: Request) -> dict:
+    """提交 BED12 歧义转录本行的裁决（选定候选 / 撤销）。
+
+    语义、版本乐观锁与错误码与 BED3 的
+    ``POST /api/result/{token}/decisions`` 完全一致。
+    """
+    body = await _read_json_body(request)
+    version = _require_int(body, "version")
+    source_line = _require_int(body, "source_line")
+    if "candidate_index" not in body:
+        raise HTTPException(status_code=400,
+                            detail={"errors": ["缺少字段 candidate_index"]})
+    candidate_index = body["candidate_index"]
+    if candidate_index is not None and (
+        not isinstance(candidate_index, int) or isinstance(candidate_index, bool)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={"errors": ["candidate_index 必须是正整数或 null"]},
+        )
+
+    job = _get_bed12_job_or_404(token)
+
+    async with job.lock:
+        if version != job.version:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "errors": [
+                        f"结果版本已过期：提交基于版本 {version}，当前为 {job.version}，"
+                        "请先重新查看当前选择后再提交"
+                    ],
+                    "current_version": job.version,
+                },
+            )
+
+        row = next((r for r in job.rows if r.line_no == source_line), None)
+        if row is None:
+            raise HTTPException(
+                status_code=400,
+                detail={"errors": [f"源文件第 {source_line} 行不存在于本次 BED12 结果中"]},
+            )
+        if row.status != "ambiguous":
+            raise HTTPException(
+                status_code=400,
+                detail={"errors": [
+                    f"源文件第 {source_line} 行状态为 {row.status}，"
+                    "只有歧义（ambiguous）行允许人工裁决"
+                ]},
+            )
+
+        n_cand = len(row.candidates)
+        if candidate_index is not None and not (1 <= candidate_index <= n_cand):
+            raise HTTPException(
+                status_code=400,
+                detail={"errors": [
+                    f"候选序号越界：第 {source_line} 行共有 {n_cand} 个候选，"
+                    f"收到 candidate_index={candidate_index}，允许范围 1..{n_cand}"
+                ]},
+            )
+
+        previous = job.decisions.get(source_line)
+        modified = previous != candidate_index
+        if modified:
+            if candidate_index is None:
+                job.decisions.pop(source_line, None)
+            else:
+                job.decisions[source_line] = candidate_index
+            job.version += 1
+
+        return {
+            "download_token": token,
+            "version": job.version,
+            "modified": modified,
+            "source_line": source_line,
+            "candidate_index": candidate_index,
+        }
+
+
+@app.get("/api/bed12/download/{token}/adjudicated")
+async def bed12_download_adjudicated(token: str) -> Response:
+    """下载裁决版 BED12（已裁决歧义行只保留被选候选；未裁决全部保留）。"""
+    job = _get_bed12_job_or_404(token)
+    text = build_bed12_adjudicated(job.rows, job.records, job.decisions)
+    payload = text.encode("utf-8")
+    filename = _adjudicated_name(job.filename, job.version)
+    return _bed12_response(payload, filename)
 
 
 def _get_job_or_404(token: str) -> _Job:
@@ -434,8 +709,9 @@ async def submit_decisions(token: str, request: Request) -> dict:
 
 
 def _adjudicated_name(filename: str, version: int) -> str:
-    if filename.endswith(".tsv"):
-        return f"{filename[:-4]}.adjudicated.v{version}.tsv"
+    if filename.endswith((".tsv", ".bed")):
+        stem, ext = filename.rsplit(".", 1)
+        return f"{stem}.adjudicated.v{version}.{ext}"
     return f"{filename}.adjudicated.v{version}.tsv"
 
 

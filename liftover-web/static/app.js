@@ -87,11 +87,23 @@ function currentMode() {
   return form.querySelector('input[name="mode"]:checked').value;
 }
 
+const BED12_MODES = new Set(["bed12_single", "bed12_double"]);
+const MODE_LABELS = {
+  single: "BED3 单段",
+  double: "BED3 双段",
+  bed12_single: "BED12 单段",
+  bed12_double: "BED12 双段",
+};
+
 form.querySelectorAll('input[name="mode"]').forEach((radio) => {
   radio.addEventListener("change", () => {
     const mode = currentMode();
-    singleFields.classList.toggle("hidden", mode !== "single");
-    doubleFields.classList.toggle("hidden", mode !== "double");
+    const isBed12 = BED12_MODES.has(mode);
+    singleFields.classList.toggle("hidden", !["single", "bed12_single"].includes(mode));
+    doubleFields.classList.toggle("hidden", !["double", "bed12_double"].includes(mode));
+    document.getElementById("bed-label").textContent = isBed12
+      ? "BED12 文件（严格 12 列，零基左闭右开）"
+      : "BED 文件（零基左闭右开）";
   });
 });
 
@@ -109,12 +121,16 @@ form.addEventListener("submit", async (ev) => {
   resultBox.classList.add("hidden");
 
   const mode = currentMode();
+  const isBed12 = BED12_MODES.has(mode);
   const clientErrors = [];
-  if (!bedInput.files[0]) clientErrors.push("请选择 BED 文件");
+  if (!bedInput.files[0]) clientErrors.push(isBed12 ? "请选择 BED12 文件" : "请选择 BED 文件");
   if (mode === "single" && !chainInput.files[0]) {
     clientErrors.push("请选择 UCSC chain 文件");
   }
-  if (mode === "double") {
+  if (mode === "bed12_single" && !chainInput.files[0]) {
+    clientErrors.push("请选择 UCSC chain 文件");
+  }
+  if (mode === "double" || mode === "bed12_double") {
     if (!chain1Input.files[0]) clientErrors.push("请选择 chain 文件 1（第一段）");
     if (!chain2Input.files[0]) clientErrors.push("请选择 chain 文件 2（第二段）");
   }
@@ -128,16 +144,27 @@ form.addEventListener("submit", async (ev) => {
 
   const fd = new FormData();
   fd.append("bed", bedInput.files[0]);
-  let url = "/api/liftover";
+  let url;
   if (mode === "double") {
     fd.append("chain1", chain1Input.files[0]);
     fd.append("chain2", chain2Input.files[0]);
     fd.append("side1", form.querySelector('input[name="side1"]:checked').value);
     fd.append("side2", form.querySelector('input[name="side2"]:checked').value);
     url = "/api/liftover2";
+  } else if (mode === "bed12_single") {
+    fd.append("chain", chainInput.files[0]);
+    fd.append("side", form.querySelector('input[name="side"]:checked').value);
+    url = "/api/bed12/liftover";
+  } else if (mode === "bed12_double") {
+    fd.append("chain1", chain1Input.files[0]);
+    fd.append("chain2", chain2Input.files[0]);
+    fd.append("side1", form.querySelector('input[name="side1"]:checked').value);
+    fd.append("side2", form.querySelector('input[name="side2"]:checked').value);
+    url = "/api/bed12/liftover2";
   } else {
     fd.append("chain", chainInput.files[0]);
     fd.append("side", form.querySelector('input[name="side"]:checked').value);
+    url = "/api/liftover";
   }
 
   try {
@@ -155,6 +182,9 @@ form.addEventListener("submit", async (ev) => {
     resultVersion = 0;
     resetFilterPanel();
     renderStats(statsEl, data.preview.total, data.preview.counts);
+    if (BED12_MODES.has(currentKind)) {
+      exportedBed12Note(data.preview);
+    }
     await refreshDecisions();
     renderRows();
     resultBox.classList.remove("hidden");
@@ -167,19 +197,30 @@ form.addEventListener("submit", async (ev) => {
   }
 });
 
+function isBed12Kind(kind) {
+  return BED12_MODES.has(kind);
+}
+
+function apiBase() {
+  return isBed12Kind(currentKind) ? "/api/bed12" : "/api";
+}
+
 downloadBtn.addEventListener("click", () => {
   if (!currentToken) return;
   // 直接触发浏览器下载；token 只在转换完全成功后才存在。
   // 原始结果不随裁决改变。
-  triggerDownload(`/api/download/${encodeURIComponent(currentToken)}`, currentName || "");
+  const path = isBed12Kind(currentKind)
+    ? `/api/bed12/download/${encodeURIComponent(currentToken)}`
+    : `/api/download/${encodeURIComponent(currentToken)}`;
+  triggerDownload(path, currentName || "");
 });
 
 downloadAdjBtn.addEventListener("click", () => {
   if (!currentToken) return;
-  triggerDownload(
-    `/api/download/${encodeURIComponent(currentToken)}/adjudicated`,
-    "",
-  );
+  const path = isBed12Kind(currentKind)
+    ? `/api/bed12/download/${encodeURIComponent(currentToken)}/adjudicated`
+    : `/api/download/${encodeURIComponent(currentToken)}/adjudicated`;
+  triggerDownload(path, "");
 });
 
 function triggerDownload(href, name) {
@@ -193,7 +234,10 @@ function triggerDownload(href, name) {
 
 async function refreshDecisions() {
   // 从服务端拉取当前选择与版本（裁决只保存在服务端该结果上）
-  const resp = await fetch(`/api/result/${encodeURIComponent(currentToken)}/decisions`);
+  const decisionsUrl = isBed12Kind(currentKind)
+    ? `/api/bed12/result/${encodeURIComponent(currentToken)}/decisions`
+    : `/api/result/${encodeURIComponent(currentToken)}/decisions`;
+  const resp = await fetch(decisionsUrl);
   if (!resp.ok) {
     decisions = {};
     return;
@@ -238,8 +282,11 @@ async function submitDecision(sourceLine, candidateIndex, label) {
   setActionMsg(`正在提交第 ${sourceLine} 行的裁决（${label}）…`, "muted");
   renderRows();
   try {
+    const decisionUrl = isBed12Kind(currentKind)
+      ? `/api/bed12/result/${encodeURIComponent(currentToken)}/decisions`
+      : `/api/result/${encodeURIComponent(currentToken)}/decisions`;
     const resp = await fetch(
-      `/api/result/${encodeURIComponent(currentToken)}/decisions`,
+      decisionUrl,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -525,7 +572,9 @@ function renderRows() {
     }
 
     const tdDest = document.createElement("td");
-    if (currentKind === "double") {
+    if (isBed12Kind(currentKind)) {
+      renderBed12Dest(row, tdDest);
+    } else if (currentKind === "double") {
       renderDoubleDest(row, tdDest);
     } else {
       renderSingleDest(row, tdDest);
@@ -540,6 +589,105 @@ function renderRows() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// BED12 转录本整体迁移结果渲染
+// ---------------------------------------------------------------------------
+
+function exportedBed12Note(preview) {
+  // BED12 下载文件只包含 mapped/ambiguous 候选行；unmapped 行不产生伪 BED12
+  const n = preview.exported_bed12_lines;
+  setActionMsg(
+    n > 0
+      ? `BED12 结果文件将写入 ${n} 条记录行（歧义行每个候选各一行；unmapped 行不写入）。`
+      : "本次转换没有任何可导出的 BED12 记录（全部行无完整路径），下载文件为空且不产生伪 BED12 行。",
+    n > 0 ? "ok" : "error",
+  );
+}
+
+function fmtBed12Candidate(cand) {
+  const sizes = cand.out_block_sizes.join(",") + ",";
+  const starts = cand.out_block_starts.join(",") + ",";
+  return (
+    `${cand.dest_chrom}\t${cand.out_start}\t${cand.out_end}\t…\t…\t${cand.out_strand}\t` +
+    `${cand.out_thick_start}\t${cand.out_thick_end}\t…\t${cand.out_block_sizes.length}\t` +
+    `${sizes}\t${starts}`
+  );
+}
+
+function renderBed12Dest(row, tdDest) {
+  if (row.candidates.length === 0) {
+    tdDest.textContent = "—（无完整路径，不导出 BED12 行）";
+    return;
+  }
+  const isAmb = row.status === "ambiguous";
+  const picked = decisions[row.line_no];
+  const box = isAmb ? document.createElement("div") : null;
+  if (isAmb) box.className = "decision-box";
+
+  row.candidates.forEach((cand, ci) => {
+    const div = document.createElement("div");
+    div.className = isAmb ? "cand decision-cand" : "cand";
+    if (isAmb && picked === ci + 1) div.classList.add("selected");
+
+    const pathText = isBed12DoubleKind()
+      ? `路径 ${ci + 1}/${row.candidates.length} · chain1 #${cand.chain1_id} × chain2 #${cand.chain2_id}`
+      : `候选 ${ci + 1}/${row.candidates.length} · chain ${cand.chain_id}`;
+    if (isAmb) {
+      const label = document.createElement("label");
+      label.className = "cand-pick";
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = `dec-${row.line_no}`;
+      radio.value = String(ci + 1);
+      radio.checked = picked === ci + 1;
+      radio.disabled = decisionPending;
+      radio.addEventListener("change", () => {
+        submitDecision(row.line_no, ci + 1, `候选 ${ci + 1}/${row.candidates.length}`);
+      });
+      label.appendChild(radio);
+      label.appendChild(document.createTextNode(pathText));
+      div.appendChild(label);
+    } else {
+      const head = document.createElement("div");
+      head.className = "cand-head";
+      head.textContent = pathText;
+      div.appendChild(head);
+    }
+
+    const coord = document.createElement("div");
+    coord.className = "frag-line";
+    coord.textContent =
+      `${cand.dest_chrom}:${cand.out_start}-${cand.out_end} ` +
+      `strand ${cand.out_strand}${cand.reversed ? "（整体反转，已翻转 strand）" : ""}；` +
+      `thick ${cand.out_thick_start}-${cand.out_thick_end}；` +
+      `${cand.out_block_sizes.length} 个外显子`;
+    div.appendChild(coord);
+
+    cand.exons.forEach((e, ei) => {
+      const fl = document.createElement("div");
+      fl.className = "frag-line";
+      const mid = isBed12DoubleKind()
+        ? ` → 中间 ${cand.mid_chrom}:[${e.mid_start},${e.mid_end})(${cand.mid_strand})`
+        : "";
+      fl.textContent =
+        `外显子${ei + 1} 源[${e.src_start},${e.src_end})${mid} → ` +
+        `${cand.dest_chrom}:[${e.dest_start},${e.dest_end})`;
+      div.appendChild(fl);
+    });
+
+    (isAmb ? box : tdDest).appendChild(div);
+  });
+
+  if (isAmb) {
+    box.appendChild(buildUndoPick(row));
+    tdDest.appendChild(box);
+  }
+}
+
+function isBed12DoubleKind() {
+  return currentKind === "bed12_double";
+}
+
 function formatSize(n) {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -551,12 +699,13 @@ function formatSize(n) {
 // ---------------------------------------------------------------------------
 
 function resetFilterPanel() {
-  filterPanel.classList.toggle("hidden", currentKind !== "double");
+  const supportsDoubleTools = currentKind === "double";
+  filterPanel.classList.toggle("hidden", !supportsDoubleTools);
   filterResult.classList.add("hidden");
   filterDownloadUrl = null;
   filterDownloadName = null;
   setFilterMsg("");
-  auditPanel.classList.toggle("hidden", currentKind !== "double");
+  auditPanel.classList.toggle("hidden", !supportsDoubleTools);
   auditResult.classList.add("hidden");
   auditDownloadUrl = null;
   auditDownloadName = null;
